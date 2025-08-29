@@ -1,5 +1,3 @@
-#v2.1 klipper 0.13.0
-
 from math import cos, exp, pi
 from random import randint
 
