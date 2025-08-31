@@ -58,7 +58,7 @@ check_folders()
 link_extension()
 {
     echo -n "Linking extension to Klipper... "
-    ln -sf "${SRCDIR}/bed_status_led.py" "${KLIPPER_PATH}/klippy/extras/bed_status_led.py"
+    ln -sf "${SRCDIR}/led_effect.py.py" "${KLIPPER_PATH}/klippy/extras/led_effect.py.py"
     echo "[OK]"
 }
 
@@ -75,7 +75,7 @@ add_updater()
 {
     echo -e -n "Adding update manager to moonraker.conf... "
 
-    update_section=$(grep -c '\[update_manager bed_status_led\]' ${MOONRAKER_CONFIG_DIR}/moonraker.conf || true)
+    update_section=$(grep -c '\[update_manager led_effect.py\]' ${MOONRAKER_CONFIG_DIR}/moonraker.conf || true)
     if [ "${update_section}" -eq 0 ]; then
         echo -e "\n" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
         while read -r line; do
@@ -85,7 +85,7 @@ add_updater()
         echo "[OK]"
         restart_moonraker
         else
-        echo -e "[update_manager bed_status_led] already exists in moonraker.conf [SKIPPED]"
+        echo -e "[update_manager led_effect.py] already exists in moonraker.conf [SKIPPED]"
     fi
 }
 
@@ -112,13 +112,13 @@ stop_klipper()
 
 uninstall()
 {
-    if [ -f "${KLIPPER_PATH}/klippy/extras/bed_status_led.py" ]; then
+    if [ -f "${KLIPPER_PATH}/klippy/extras/led_effect.py.py" ]; then
         echo -n "Uninstalling... "
-        rm -f "${KLIPPER_PATH}/klippy/extras/bed_status_led.py"
+        rm -f "${KLIPPER_PATH}/klippy/extras/led_effect.py.py"
         echo "[OK]"
-        echo "You can now remove the [update_manager led_effect] section in your moonraker.conf and delete this directory. Also remove all bed_status_led configurations from your Klipper configuration."
+        echo "You can now remove the [update_manager led_effect] section in your moonraker.conf and delete this directory. Also remove all led_effect.py configurations from your Klipper configuration."
     else
-        echo "bed_status_led.py not found in \"${KLIPPER_PATH}/klippy/extras/\". Is it installed?"
+        echo "led_effect.py.py not found in \"${KLIPPER_PATH}/klippy/extras/\". Is it installed?"
         echo "[FAILED]"
     fi
 }
