@@ -58,7 +58,7 @@ check_folders()
 link_extension()
 {
     echo -n "Linking extension to Klipper... "
-    ln -sf "${SRCDIR}/led_effect.py.py" "${KLIPPER_PATH}/klippy/extras/led_effect.py.py"
+    ln -sf "${SRCDIR}/led_effect.py" "${KLIPPER_PATH}/klippy/extras/led_effect.py"
     echo "[OK]"
 }
 
@@ -70,6 +70,24 @@ restart_moonraker()
     echo "[OK]"
 }
 
+# Add updater for led_effect to moonraker.conf
+add_updater()
+{
+    echo -e -n "Adding update manager to moonraker.conf... "
+
+    update_section=$(grep -c '\[update_manager led_effect\]' ${MOONRAKER_CONFIG_DIR}/moonraker.conf || true)
+    if [ "${update_section}" -eq 0 ]; then
+        echo -e "\n" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
+        while read -r line; do
+            echo -e "${line}" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
+        done < "$PWD/file_templates/moonraker_update.txt"
+        echo -e "\n" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
+        echo "[OK]"
+        restart_moonraker
+        else
+        echo -e "[update_manager led_effect] already exists in moonraker.conf [SKIPPED]"
+    fi
+}
 
 restart_klipper()
 {
@@ -94,13 +112,13 @@ stop_klipper()
 
 uninstall()
 {
-    if [ -f "${KLIPPER_PATH}/klippy/extras/led_effect.py.py" ]; then
+    if [ -f "${KLIPPER_PATH}/klippy/extras/led_effect.py" ]; then
         echo -n "Uninstalling... "
-        rm -f "${KLIPPER_PATH}/klippy/extras/led_effect.py.py"
+        rm -f "${KLIPPER_PATH}/klippy/extras/led_effect.py"
         echo "[OK]"
-        echo "You can now remove the [update_manager led_effect] section in your moonraker.conf and delete this directory. Also remove all led_effect.py configurations from your Klipper configuration."
+        echo "You can now remove the [update_manager led_effect] section in your moonraker.conf and delete this directory. Also remove all led_effect configurations from your Klipper configuration."
     else
-        echo "led_effect.py.py not found in \"${KLIPPER_PATH}/klippy/extras/\". Is it installed?"
+        echo "led_effect.py not found in \"${KLIPPER_PATH}/klippy/extras/\". Is it installed?"
         echo "[FAILED]"
     fi
 }
@@ -121,6 +139,7 @@ check_folders
 stop_klipper
 if [ ! $UNINSTALL ]; then
     link_extension
+    add_updater
 else
     uninstall
 fi
