@@ -29,5 +29,6 @@ section in the Moonraker configuration. Then run the script to remove the link:
 
 
 ##    Это аля бамбук полоска на столе, но для qidi q1
+![IMG_0593](https://github.com/user-attachments/assets/a6460a70-25b8-4d37-a369-f2386bf95257)
 
-![IMG_0592](https://github.com/user-attachments/assets/9f737787-3223-480b-ac84-a0272b59c282)
+
