@@ -27,4 +27,5 @@ section in the Moonraker configuration. Then run the script to remove the link:
     cd klipper-led_effect
     ./install-led_effect.sh -u
 
-    Это аля бамбук полоска на столе, но для qidi q1
+
+##    Это аля бамбук полоска на столе, но для qidi q1
