@@ -28,7 +28,7 @@ section in the Moonraker configuration. Then run the script to remove the link:
     ./install-led_effect.sh -u
 
 
-##    Это аля бамбук полоска на столе, но для qidi q1
+##    Это аля бамбук полоска на столе, но для qidi q1 с прошивкой FreeDi
 ![IMG_0593](https://github.com/user-attachments/assets/a6460a70-25b8-4d37-a369-f2386bf95257)
 
 
