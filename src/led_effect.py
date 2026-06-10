@@ -1,9 +1,5 @@
 from math import cos, exp, pi
-from random import randint
 
-ANALOG_SAMPLE_TIME  = 0.001
-ANALOG_SAMPLE_COUNT = 5
-ANALOG_REPORT_TIME  = 0.05
 
 COLORS = 4
 
@@ -71,60 +67,185 @@ class ledFrameHandler:
         self.printer = config.get_printer()
         self.gcode   = self.printer.lookup_object('gcode')
         self.printer.load_object(config, "display_status")
-        self.heaters = {}
         self.printProgress = 0
         self.effects = []
-        self.stepperPositions = [0.0,0.0,0.0]
-        self.stepperTimer     = None
-        self.heaterCurrent   = {}
-        self.heaterTarget    = {}
-        self.heaterLast      = {}
-        self.heaterTimer     = None
-        self.homing          = {}
-        self.homing_start_flag = {}
-        self.homing_end_flag = {}
         self.state = "idle"
         self.door_open = False
         self.print_completed = False
         self.completed_exited = False
-        self.print_start_detected = False
-        self.last_print_state = ""
+        self.door_button_pin = config.get('door_button_pin', None)
+        self.door_button_open_state = config.get('door_button_open_state', 'pressed').strip().lower()
+        self.door_button_raw_state = None
+        self.pause_resume = None
+        self.virtual_sdcard = None
+        self.gcode_move = None
+        self.print_session_active = False
+        self.first_layer_print_detected = False
+        self._print_detect_last_e = None
+        self._print_detect_extruded = 0.0
+        self.filament_status_objects = []
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
-        self.printer.register_event_handler("homing:homing_move_begin",
-                                            self._handle_homing_move_begin)
-        self.printer.register_event_handler("homing:homing_move_end",
-                                            self._handle_homing_move_end)
         self.ledChains=[]
         self.gcode.register_command('STOP_LED_EFFECTS',
                                     self.cmd_STOP_LED_EFFECTS,
                                     desc=self.cmd_STOP_LED_EFFECTS_help)
-        self.gcode.register_command('DOOR_OPEN',
-                                  self.cmd_DOOR_OPEN,
-                                  desc="Set door open state")
-        self.gcode.register_command('DOOR_CLOSED',
-                                  self.cmd_DOOR_CLOSED,
-                                  desc="Set door closed state")
-        self.gcode.register_command('START_PRINT_DETECT',
-                                  self.cmd_START_PRINT_DETECT,
-                                  desc="Signal the start of printing")        
+
+        self.gcode.register_command('LED_EFFECT_DEBUG_STATUS',
+                                  self.cmd_LED_EFFECT_DEBUG_STATUS,
+                                  desc="Show led_effect state and Klipper printer objects used by status effects")        
 
         self.on_off_pin_name = config.get('on_off_pin', None)
         self.on_off_pin = None        
         self.shutdown = False
 
+        if self.door_button_pin:
+            buttons = self.printer.load_object(config, "buttons")
+            buttons.register_buttons([self.door_button_pin], self._door_button_callback)
+
     cmd_STOP_LED_EFFECTS_help = 'Stops all led_effects'
 
-    def cmd_DOOR_OPEN(self, gcmd):
-        self.door_open = True
+    def _door_button_callback(self, eventtime, state):
+        # Internal physical door input.
+        # Klipper buttons passes state as 1/True for pressed, 0/False for released.
+        self.door_button_raw_state = bool(state)
+
+        if self.door_button_open_state in ("pressed", "press", "1", "true", "open"):
+            self.door_open = bool(state)
+        elif self.door_button_open_state in ("released", "release", "0", "false", "closed"):
+            self.door_open = not bool(state)
+        else:
+            # Safe default for current Qidi wiring: pressed means door open.
+            self.door_open = bool(state)
+
         self._update_state()
 
-    def cmd_DOOR_CLOSED(self, gcmd):
-        self.door_open = False
-        self._update_state()
 
-    def cmd_START_PRINT_DETECT(self, gcmd):
-        self.print_start_detected = True
-        self._update_state()
+    def _debug_respond(self, gcmd, msg):
+        try:
+            gcmd.respond_info(str(msg))
+        except Exception:
+            try:
+                self.gcode.respond_info(str(msg))
+            except Exception:
+                pass
+
+    def _debug_safe_status(self, object_name, eventtime):
+        try:
+            obj = self.printer.lookup_object(object_name, None)
+            if obj is None:
+                return None
+            if hasattr(obj, "get_status"):
+                return obj.get_status(eventtime)
+            return {"object": "present", "get_status": "not_available"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _debug_list_objects(self):
+        names = []
+        try:
+            if hasattr(self.printer, "lookup_objects"):
+                for item in self.printer.lookup_objects():
+                    try:
+                        names.append(item[0])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return sorted(set(names))
+
+    def _debug_find_objects(self, prefixes):
+        names = self._debug_list_objects()
+        found = []
+        for name in names:
+            for prefix in prefixes:
+                if name == prefix or name.startswith(prefix + " "):
+                    found.append(name)
+                    break
+        return found
+
+    def cmd_LED_EFFECT_DEBUG_STATUS(self, gcmd):
+        try:
+            eventtime = self.reactor.monotonic()
+        except Exception:
+            try:
+                eventtime = self.printer.get_reactor().monotonic()
+            except Exception:
+                eventtime = 0.0
+
+        self._debug_respond(gcmd, "=== LED_EFFECT_DEBUG_STATUS ===")
+        self._debug_respond(gcmd, "led_effect.state: %s" % getattr(self, "state", "unknown"))
+        self._debug_respond(gcmd, "shutdown: %s" % getattr(self, "shutdown", "unknown"))
+        self._debug_respond(gcmd, "door_open: %s" % getattr(self, "door_open", "unknown"))
+        self._debug_respond(gcmd, "door_button_pin: %s" % getattr(self, "door_button_pin", None))
+        self._debug_respond(gcmd, "door_button_open_state: %s" % getattr(self, "door_button_open_state", None))
+        self._debug_respond(gcmd, "door_button_raw_state: %s" % getattr(self, "door_button_raw_state", None))
+        self._debug_respond(gcmd, "print_completed: %s" % getattr(self, "print_completed", "unknown"))
+        self._debug_respond(gcmd, "print_session_active: %s" % getattr(self, "print_session_active", "unknown"))
+        self._debug_respond(gcmd, "completed_exited: %s" % getattr(self, "completed_exited", "unknown"))
+        self._debug_respond(gcmd, "printProgress: %s" % getattr(self, "printProgress", "unknown"))
+        self._debug_respond(gcmd, "auto_display_progress: %.5f" % self._get_display_progress_fraction(eventtime))
+        self._debug_respond(gcmd, "auto_virtual_progress: %.5f" % self._get_virtual_progress_fraction(eventtime))
+        self._debug_respond(gcmd, "auto_virtual_active: %s" % self._is_virtual_sdcard_active(eventtime))
+        self._debug_respond(gcmd, "gcode_position: %s" % self._get_gcode_position(eventtime))
+        self._debug_respond(gcmd, "first_layer_print_detected: %s" % getattr(self, "first_layer_print_detected", "unknown"))
+        self._debug_respond(gcmd, "first_layer_extruded: %.5f" % getattr(self, "_print_detect_extruded", 0.0))
+
+        fixed_objects = [
+            "print_stats",
+            "display_status",
+            "pause_resume",
+            "webhooks",
+            "virtual_sdcard",
+        ]
+
+        for name in fixed_objects:
+            status = self._debug_safe_status(name, eventtime)
+            self._debug_respond(gcmd, "%s: %s" % (name, status))
+
+        dynamic_prefixes = [
+            "filament_switch_sensor",
+            "filament_motion_sensor",
+            "hall_filament_width_sensor",
+            "gcode_button",
+            "output_pin",
+            "neopixel",
+        ]
+
+        found = self._debug_find_objects(dynamic_prefixes)
+        self._debug_respond(gcmd, "found status objects: %s" % (", ".join(found) if found else "none"))
+
+        for name in found:
+            status = self._debug_safe_status(name, eventtime)
+            self._debug_respond(gcmd, "%s: %s" % (name, status))
+
+        enabled = []
+        disabled = []
+        for effect in self.effects:
+            row = "%s idle=%s pause=%s pause_attention=%s preparing=%s progress=%s completed=%s error=%s" % (
+                getattr(effect, "name", "unknown"),
+                getattr(effect, "run_on_idle", False),
+                getattr(effect, "run_on_pause", False),
+                getattr(effect, "run_on_pause_attention", False),
+                getattr(effect, "run_on_preparing", False),
+                getattr(effect, "run_on_progress", False),
+                getattr(effect, "run_on_completed", False),
+                getattr(effect, "run_on_error", False),
+            )
+            if getattr(effect, "enabled", False):
+                enabled.append(row)
+            else:
+                disabled.append(row)
+
+        self._debug_respond(gcmd, "enabled effects:")
+        for row in enabled:
+            self._debug_respond(gcmd, "  " + row)
+
+        self._debug_respond(gcmd, "disabled effects:")
+        for row in disabled:
+            self._debug_respond(gcmd, "  " + row)
+
+        self._debug_respond(gcmd, "=== END LED_EFFECT_DEBUG_STATUS ===")
+
 
     def _handle_ready(self):
         self.shutdown = False
@@ -145,15 +266,245 @@ class ledFrameHandler:
             except:
                 self.on_off_pin = None
 
-        self.print_stats = self.printer.lookup_object('print_stats', None)         
+        self.print_stats = self.printer.lookup_object('print_stats', None)
+        self.pause_resume = self.printer.lookup_object('pause_resume', None)
+        self.virtual_sdcard = self.printer.lookup_object('virtual_sdcard', None)
+        self.gcode_move = self.printer.lookup_object('gcode_move', None)
+        self.filament_status_objects = self._find_status_objects([
+            "filament_switch_sensor",
+            "filament_motion_sensor",
+            "hall_filament_width_sensor",
+        ])
         self._update_state()
+
+
+    def _list_status_object_names(self):
+        names = []
+        try:
+            if hasattr(self.printer, "lookup_objects"):
+                for item in self.printer.lookup_objects():
+                    try:
+                        names.append(item[0])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return sorted(set(names))
+
+    def _find_status_objects(self, prefixes):
+        found = []
+        for name in self._list_status_object_names():
+            for prefix in prefixes:
+                if name == prefix or name.startswith(prefix + " "):
+                    found.append(name)
+                    break
+        return found
+
+    def _safe_object_status(self, object_name, eventtime):
+        try:
+            obj = self.printer.lookup_object(object_name, None)
+            if obj is None or not hasattr(obj, "get_status"):
+                return None
+            return obj.get_status(eventtime)
+        except Exception:
+            return None
+
+
+    def _is_pause_active(self, eventtime, print_state):
+        # Prefer native pause_resume.is_paused, keep print_stats.state fallback.
+        if self.pause_resume is not None:
+            try:
+                status = self.pause_resume.get_status(eventtime)
+                if bool(status.get("is_paused", False)):
+                    return True
+            except Exception:
+                pass
+        return print_state == "paused"
+
+    def _is_filament_attention_active(self, eventtime):
+        # Sensor attention means: a known enabled filament sensor reports
+        # filament_detected == False. This is intentionally generic, so it
+        # works for switch/tangle/hall sensors without extra config macros.
+        for object_name in getattr(self, "filament_status_objects", []):
+            status = self._safe_object_status(object_name, eventtime)
+            if not status:
+                continue
+
+            if status.get("enabled", True) is False:
+                continue
+
+            if "filament_detected" in status and status.get("filament_detected") is False:
+                return True
+
+        return False
+
+
+    def _get_display_progress_fraction(self, eventtime):
+        try:
+            if self.displayStatus is None:
+                return 0.0
+            status = self.displayStatus.get_status(eventtime)
+            progress = status.get("progress", 0.0)
+            if progress is None:
+                return 0.0
+            return max(0.0, min(1.0, float(progress)))
+        except Exception:
+            return 0.0
+
+    def _get_virtual_sdcard_status(self, eventtime):
+        try:
+            if self.virtual_sdcard is None:
+                return {}
+            return self.virtual_sdcard.get_status(eventtime)
+        except Exception:
+            return {}
+
+    def _get_virtual_progress_fraction(self, eventtime):
+        status = self._get_virtual_sdcard_status(eventtime)
+        try:
+            progress = status.get("progress", 0.0)
+            if progress is not None:
+                progress = max(0.0, min(1.0, float(progress)))
+                if progress > 0.0:
+                    return progress
+        except Exception:
+            pass
+
+        try:
+            file_position = float(status.get("file_position", 0) or 0)
+            file_size = float(status.get("file_size", 0) or 0)
+            if file_size > 0.0 and file_position > 0.0:
+                return max(0.0, min(1.0, file_position / file_size))
+        except Exception:
+            pass
+
+        return 0.0
+
+    def _is_virtual_sdcard_active(self, eventtime):
+        status = self._get_virtual_sdcard_status(eventtime)
+        try:
+            return bool(status.get("is_active", False))
+        except Exception:
+            return False
+
+
+    def _get_gcode_position(self, eventtime):
+        try:
+            if self.gcode_move is None:
+                return None
+            status = self.gcode_move.get_status(eventtime)
+            pos = status.get("gcode_position", None)
+            if pos is None or len(pos) < 4:
+                return None
+            return [float(pos[0]), float(pos[1]), float(pos[2]), float(pos[3])]
+        except Exception:
+            return None
+
+    def _reset_first_layer_detector(self):
+        self.first_layer_print_detected = False
+        self._print_detect_last_e = None
+        self._print_detect_extruded = 0.0
+
+    def _is_printing_started_automatically(self, eventtime, print_status):
+        # Do NOT use virtual_sdcard.progress/file_position as the main trigger.
+        # That moves during start G-code and switches too early.
+        #
+        # We switch Preparing -> Printing only after real positive extrusion
+        # appears on first-layer Z range.
+        if self.first_layer_print_detected:
+            return True
+
+        pos = self._get_gcode_position(eventtime)
+        if pos is None:
+            # Last-resort fallback only, to avoid being stuck forever if gcode_move
+            # is unavailable on a modified Klipper build.
+            display_progress = self._get_display_progress_fraction(eventtime)
+            virtual_progress = self._get_virtual_progress_fraction(eventtime)
+            if max(display_progress, virtual_progress) >= 0.020:
+                self.first_layer_print_detected = True
+                return True
+            return False
+
+        z = pos[2]
+        e = pos[3]
+
+        if self._print_detect_last_e is None:
+            self._print_detect_last_e = e
+            return False
+
+        de = e - self._print_detect_last_e
+        self._print_detect_last_e = e
+
+        # Count only positive extrusion. Ignore retracts, G92 E0 resets and negative jumps.
+        if 0.0 < de < 25.0:
+            self._print_detect_extruded += de
+
+        # First-layer zone. This is intentionally wide enough for normal first layer,
+        # adaptive first layer and purge/prime at bed level, but it will not trigger
+        # during heating/homing/travel.
+        first_layer_z_min = 0.02
+        first_layer_z_max = 1.20
+
+        # Enough extrusion to avoid switching on tiny E noise.
+        extrusion_threshold = 0.60
+
+        if (
+            first_layer_z_min <= z <= first_layer_z_max and
+            self._print_detect_extruded >= extrusion_threshold
+        ):
+            self.first_layer_print_detected = True
+            return True
+
+        return False
+
+
+    def _is_print_file_active(self, eventtime):
+        status = self._get_virtual_sdcard_status(eventtime)
+        try:
+            if bool(status.get("is_active", False)):
+                return True
+        except Exception:
+            pass
+
+        try:
+            file_path = status.get("file_path", None)
+            if file_path:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _has_print_context(self, eventtime, print_state):
+        # True only when a real file print session has started.
+        # This prevents Pause_Status / Pause_Attention_Status from triggering
+        # during manual filament loading, manual extrusion, maintenance, etc.
+        if print_state == "printing":
+            return True
+
+        if self.print_session_active:
+            return True
+
+        if self._is_print_file_active(eventtime):
+            return True
+
+        return False
+
 
     def _update_state(self):
         eventtime = self.reactor.monotonic()
         new_state = "idle"
-        
+        print_state = ""
+        print_status = {}
+
         if self.print_stats:
-            print_state = self.print_stats.get_status(eventtime)['state']
+            print_status = self.print_stats.get_status(eventtime)
+            print_state = print_status.get('state', '')
+
+            # Start/keep a print session only from actual file-print context.
+            if print_state == "printing" or self._is_print_file_active(eventtime):
+                self.print_session_active = True
+
             if print_state == "complete":
                 if self.door_open:
                     self.print_completed = False
@@ -161,46 +512,65 @@ class ledFrameHandler:
                 else:
                     if not self.completed_exited:
                         self.print_completed = True
-            elif print_state == "paused":
-                new_state = "pause"
+
+            elif self._is_pause_active(eventtime, print_state):
+                # Pause effects are valid only during an active print session.
+                # Manual filament load/extrude in idle must not trigger pause LEDs.
+                if self._has_print_context(eventtime, print_state):
+                    if self._is_filament_attention_active(eventtime):
+                        new_state = "pause_attention"
+                    else:
+                        new_state = "pause"
+                else:
+                    new_state = "idle"
+
             elif print_state == "printing":
                 self.print_completed = False
                 self.completed_exited = False
-                if self.print_start_detected: 
+
+                if self._is_printing_started_automatically(eventtime, print_status):
                     new_state = "printing"
                 else:
                     new_state = "preparing"
 
         if self.print_completed and not self.door_open and not self.completed_exited:
-            new_state = "completed"  
+            new_state = "completed"
         elif self.state == "completed" and self.door_open:
             new_state = "idle"
             self.print_completed = False
             self.completed_exited = True
-            
-        if new_state == "completed" or new_state == "idle":
-            self.print_start_detected = False                           
+
+        # Reset transient print-session detector only when the print is truly over.
+        if new_state == "completed":
+            self.print_session_active = False
+            self._reset_first_layer_detector()
+        elif new_state == "idle" and not self._is_print_file_active(eventtime) and print_state not in ("printing", "paused"):
+            self.print_session_active = False
+            self._reset_first_layer_detector()
 
         if new_state != self.state:
             self.state = new_state
-            self._update_led_effects()    
+            self._update_led_effects()
+
 
     def _update_led_effects(self):
         for effect in self.effects:
             should_run = (
                 (self.state == "idle" and effect.run_on_idle) or
                 (self.state == "pause" and effect.run_on_pause) or
+                (self.state == "pause_attention" and effect.run_on_pause_attention) or
                 (self.state == "preparing" and effect.run_on_preparing) or
                 (self.state == "printing" and effect.run_on_progress) or
                 (self.state == "completed" and effect.run_on_completed)
             )
-            
+
             if should_run and not effect.enabled:
                 effect.set_fade_time(0.0)
                 effect.set_enabled(True)
             elif not should_run and effect.enabled:
                 effect.set_fade_time(0.0)
-                effect.set_enabled(False)               
+                effect.set_enabled(False)
+
 
     def _transmit_chain(self, chain):
         # Force update (dotstar workaround)
@@ -225,87 +595,19 @@ class ledFrameHandler:
     def _handle_shutdown(self):
         self.shutdown = True
         for effect in self.effects:
-            if not effect.runOnShutown:
+            if not effect.run_on_error:
                 for chain in self.ledChains:
                     chain.led_helper.set_color(None, (0.0, 0.0, 0.0, 0.0))
                     self._transmit_chain(chain)
         pass
     
-    def _handle_homing_move_begin(self, hmove):
-        endstops_being_homed = [name for es,name in hmove.endstops]
-
-        for endstop in endstops_being_homed:
-            if endstop in self.homing_start_flag: 
-                self.homing_start_flag[endstop] += 1
-            else:
-                self.homing_start_flag[endstop] = 0
-                
-            self.homing[endstop]=True
         
-    def _handle_homing_move_end(self, hmove):
-        endstops_being_homed = [name for es,name in hmove.endstops]
-
-        for endstop in endstops_being_homed:
-            if endstop in self.homing_end_flag: 
-                self.homing_end_flag[endstop] += 1
-            else:
-                self.homing_end_flag[endstop] = 0
-            self.homing[endstop]=False
 
     def addEffect(self, effect):
-
-        if effect.heater:
-            effect.heater=effect.heater.strip('\"\'')
-            if effect.heater.startswith("temperature_fan ") or effect.heater.startswith("temperature_sensor "):
-                self.heaters[effect.heater] = self.printer.lookup_object(effect.heater)
-            else:
-                pheater = self.printer.lookup_object('heaters')
-                self.heaters[effect.heater] = pheater.lookup_heater(effect.heater)
-            self.heaterLast[effect.heater] = 100
-            self.heaterCurrent[effect.heater] = 0
-            self.heaterTarget[effect.heater]  = 0
-
-            if not self.heaterTimer:
-                self.heaterTimer = self.reactor.register_timer(self._pollHeater,
-                                                               self.reactor.NOW)
-
-        if effect.stepper:
-            self.toolhead = self.printer.lookup_object('toolhead')
-            self.kin = self.toolhead.get_kinematics()
-
-            if not self.stepperTimer:
-                self.stepperTimer = self.reactor.register_timer(
-                                                self._pollStepper,
-                                                self.reactor.NOW)
-
         if effect in self.effects:
             self.effects.remove(effect)
-
         self.effects.append(effect)
 
-    def _pollHeater(self, eventtime):
-        for heater in self.heaters.keys():
-            current, target = self.heaters[heater].get_temp(eventtime)
-            self.heaterCurrent[heater] = current
-            self.heaterTarget[heater]  = target
-            if target > 0:
-                self.heaterLast[heater] = target
-        return eventtime + 0.3 #sensors get updated every 300ms
-
-    def _pollStepper(self, eventtime):
-
-        kin_spos = {s.get_name(): s.get_commanded_position()
-                    for s in self.kin.get_steppers()}
-       
-        pos = self.kin.calc_position(kin_spos)
-        
-        for i in range(3):
-            if pos[i] >= self.kin.axes_min[i] and pos[i] <= self.kin.axes_max[i]:
-                self.stepperPositions[i] = int(
-                    ((pos[i] - self.kin.axes_min[i]) / \
-                     (self.kin.axes_max[i] - self.kin.axes_min[i])
-                    * 100)- 1)
-        return eventtime + 0.5
 
     def _pollProgress(self, eventtime):
         status = self.displayStatus.get_status(eventtime)
@@ -461,10 +763,7 @@ class ledEffect:
         self.frameRate    = 1.0 / config.getfloat('frame_rate', 
                                         default=24, minval=1, maxval=60)
         self.enabled      = False
-        self.iteration    = 0
         self.layers       = []
-        self.analogValue  = 0
-        self.button_state = 0
         self.fadeValue    = 0.0
         self.fadeTime     = 0.0
         self.fadeEndTime  = 0
@@ -492,14 +791,8 @@ class ledEffect:
         self.name         = config.get_name().split()[1]
 
         self.autoStart    = config.getboolean('autostart', False)
-        self.runOnShutown = config.getboolean('run_on_error', False)
+        self.run_on_error = config.getboolean('run_on_error', False)
         self.ignore_on_off_pin = config.getboolean('ignore_on_off_pin', False)
-        self.heater       = config.get('heater', None)
-        self.analogPin    = config.get('analog_pin', None)
-        self.buttonPins   = config.getlist('button_pins', None)
-        self.stepper      = config.get('stepper', None)
-        self.recalculate  = config.get('recalculate', False)
-        self.endstops     = [x.strip() for x in config.get('endstops','').split(',')]
         self.layerTempl   = self.gcode_macro.load_template(config, 'layers')
         self.configLayers = []
         self.configLeds   = config.get('leds')
@@ -510,31 +803,15 @@ class ledEffect:
                                          self.cmd_SET_LED_EFFECT,
                                          desc=self.cmd_SET_LED_EFFECT_help)
 
-        if self.analogPin:
-            ppins = self.printer.lookup_object('pins')
-            self.mcu_adc = ppins.setup_pin('adc', self.analogPin)
-            if hasattr(self.mcu_adc, 'setup_adc_sample'):
-                self.mcu_adc.setup_adc_sample(ANALOG_SAMPLE_TIME, ANALOG_SAMPLE_COUNT)
-            elif hasattr(self.mcu_adc, 'setup_minmax'):
-                self.mcu_adc.setup_minmax(ANALOG_SAMPLE_TIME, ANALOG_SAMPLE_COUNT)
-            else:
-                raise RuntimeError(
-                    "Klipper version not compatible: mcu_adc missing 'setup_adc_sample' and 'setup_minmax'.")
-            self.mcu_adc.setup_adc_callback(ANALOG_REPORT_TIME, self.adcCallback)
-            query_adc = self.printer.load_object(self.config, 'query_adc')
-            query_adc.register_adc(self.name, self.mcu_adc)
-
-        if self.buttonPins:
-            buttons = self.printer.load_object(config, "buttons")
-            buttons.register_buttons(self.buttonPins, self.button_callback)
 
         self.run_on_idle = config.getboolean('run_on_idle', False)
         self.run_on_pause = config.getboolean('run_on_pause', False)
+        self.run_on_pause_attention = config.getboolean('run_on_pause_attention', False)
         self.run_on_progress = config.getboolean('run_on_progress', False)
         self.run_on_preparing = config.getboolean('run_on_preparing', False)
         self.run_on_completed = config.getboolean('run_on_completed', False)
 
-        if any([self.run_on_pause, self.run_on_progress,
+        if any([self.run_on_pause, self.run_on_pause_attention, self.run_on_progress,
                 self.run_on_preparing, self.run_on_completed]):
             self.autoStart = False
 
@@ -687,11 +964,6 @@ class ledEffect:
                 self.set_fade_time(parmFadeTime)
             self.set_enabled(False)
         else:
-            if self.recalculate:
-                kwargs = self.layerTempl.create_template_context()
-                kwargs['params'] = gcmd.get_command_parameters()
-                kwargs['rawparams'] = gcmd.get_raw_command_parameters()
-                self._generateLayers(kwargs)
             if gcmd.get_int('REPLACE',0) >= 1:
                 for led in self.leds:
                     for effect in self.handler.effects:
@@ -710,13 +982,9 @@ class ledEffect:
         return {'enabled':self.enabled}
 
     def _handle_shutdown(self):
-        self.set_enabled(self.runOnShutown)
+        self.set_enabled(self.run_on_error)
 
-    def adcCallback(self, read_time, read_value):
-        self.analogValue = int(read_value * 1000.0) / 10.0
     
-    def button_callback(self, eventtime, state):
-        self.button_state = state
 
     ######################################################################
     # LED Effect layers
@@ -738,7 +1006,6 @@ class ledEffect:
             self.frameNumber     = 0
             self.thisFrame       = []
             self.frameCount      = 1
-            self.lastAnalog      = 0
 
         def nextFrame(self, eventtime):
             if not self.frameCount:
@@ -750,947 +1017,599 @@ class ledEffect:
 
             return self.thisFrame[self.frameNumber]
 
-        def _decayTable(self, factor=1, rate=1):
 
-            frame = []
+    # Current project layers only.
+    # This plugin is reduced to the Bambu-style bed status strip used by mod.cfg.
+    # Supported layers:
+    #   - bambu_idle
+    #   - bambu_flow
+    #   - bambu_bar
+    #   - bambu_double_flash
+    #   - bambu_complete
+    #   - bambu_pause_breathe
+    #   - bambu_pause_attention
 
-            p = (1.0 / self.frameRate)
-            r = (p/15.0)*factor
+    # BambuLab H2-style status indicator layers.
+    # idle: slow breathing
+    # preparing: orange flow
+    # printing: progress bar
+    # error: red double flash
+    # complete: green solid
+    # pause: orange breathing
+    # pause_attention: orange double flash
 
-            for s in range(0, int((rate<1)+rate)):
-                frame.append(1.0)
-                for x in range(2, int(p / rate)):
-                    b = exp(1)**-(x/r)
-                    if b>.004:
-                        frame.append(b)
-            return frame
 
-        def _gradient(self, palette, steps, reverse=False, toFirst=False):
-            palette = colorArray(COLORS, palette[:])
-            if reverse: palette.reverse()
-
-            if len(palette) == 1:
-                return colorArray(COLORS, palette * steps)
-
-            if toFirst:
-                palette += palette[0]
-
-            paletteIntervals = len(palette)-1
-            stepIntervals = steps if toFirst else steps-1
-            if stepIntervals != 0:
-                intervals_per_step = float(paletteIntervals) / stepIntervals
-            else:
-                intervals_per_step = 0
-
-            gradient=palette[0]
-
-            for i in range(1,steps):
-                j = intervals_per_step * i
-                k = int(j) 
-                r = j-k
-                k = min(k, len(palette)-1)
-
-                if ( (k+1) >= len(palette) ) | (r == 0.0) :
-                    z = palette[k]
-                else:
-                    z = [((1-r)*palette[k][m] + r*palette[k+1][m]) for m in range(COLORS)]
-                gradient += z
-            return gradient
-
-    #Individual effects inherit from the LED Effect Base class
-    #each effect must support the nextFrame() method either by
-    #using the method from the base class or overriding it.
-
-    #Solid color
-    class layerStatic(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerStatic, self).__init__(**kwargs)
-
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
-
-            gradientLength = int(self.ledCount)
-            gradient = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                gradientLength))
-
-            self.thisFrame.append(gradient[0:self.ledCount])
-            self.frameCount = len(self.thisFrame)
-
-    #Slow pulsing of color
-    class layerBreathing(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerBreathing, self).__init__(**kwargs)
-
-            brightness = []
-
-            p = (1 / self.frameRate) * (self.effectRate * 0.5)
-            o = int(p)
-            f = 2 * pi
-
-            for x in range(0, int(p)):
-                if x < p:
-                    v  = (exp(-cos((f / p) * (x+o)))-0.367879) / 2.35040238
-                else:
-                    v = 0
-
-                #clamp values
-                if v > 1.0:
-                    v = 1.0
-                elif v < 0.0:
-                    v = 0.0
-
-                brightness.append(v)
-
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-
-                for b in brightness:
-                    self.thisFrame += [[b * i for i in color] * self.ledCount]
-
-            self.frameCount = len(self.thisFrame)
-    class layerLinearFade(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerLinearFade, self).__init__(**kwargs)
-
-            gradientLength = int(self.effectRate / self.frameRate) 
-            if gradientLength == 0: gradientLength = 1
-
-            gradient   = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                   gradientLength, toFirst=True))
-
-            for i in range(gradientLength):
-                self.thisFrame.append(gradient[i]*self.ledCount)
-
-            self.frameCount = len(self.thisFrame)
-
-    #Turns the entire strip on and off
-    class layerBlink(_layerBase):
+    class layerBambu_idle(_layerBase):
         def __init__(self, **kwargs):
-            super(ledEffect.layerBlink, self).__init__(**kwargs)
-
-            dutyCycle= max(0,min(1.0, self.effectCutoff))
-            frameCountOn = int(( 1.0 / self.frameRate ) * self.effectRate\
-                 * dutyCycle)
-            frameCountOff = int(( 1.0 / self.frameRate ) * self.effectRate\
-                 * (1-dutyCycle))
-
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-                self.thisFrame += [color * self.ledCount] * frameCountOn
-                self.thisFrame += [[0]*COLORS * self.ledCount] * frameCountOff
-
-            self.frameCount = len(self.thisFrame)
-
-    #Random flashes with decay
-    class layerTwinkle(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerTwinkle, self).__init__(**kwargs)
-
-            self.thisFrame = colorArray(COLORS, ([0.0]*COLORS) * self.ledCount)
-            self.lastBrightness  = [-1] * self.ledCount
-            self.decayTable = self._decayTable(factor=1 / self.effectCutoff)
-            self.decayLen = len(self.decayTable)
-            self.colorCount = len(self.paletteColors) - 1
-
-        def nextFrame(self, eventtime):
-
-            for i in range(0, self.ledCount):
-
-                r = randint(0, self.colorCount)
-                color = self.paletteColors[r]
-
-                if randint(0, 255) > 254 - self.effectRate:
-                    self.lastBrightness[i] = 0
-                    self.thisFrame[i] = color
-
-                if self.lastBrightness[i] != -1:
-                    if self.lastBrightness[i] == self.decayLen:
-                        self.lastBrightness[i] = -1
-                        self.thisFrame[i] = ([0.0]*COLORS)
-                    else:
-                        x = self.lastBrightness[i]
-                        self.lastBrightness[i] += 1
-                        self.thisFrame[i] = [self.decayTable[x] * l
-                                                for l in self.thisFrame[i]]
-
-            return self.thisFrame
-
-    #Blinking with decay
-    class layerStrobe(_layerBase):
-        def __init__(self, **kwargs):
-            super(ledEffect.layerStrobe, self).__init__(**kwargs)
-
-            frameRate  = int(1.0 / self.frameRate)
-            if self.effectRate==0: 
-                frameCount = 1
-            else:
-                frameCount = max(1,int(frameRate / self.effectRate))
-            if self.effectCutoff==0: self.effectCutoff=0.001
-            decayTable = self._decayTable(factor=1 / self.effectCutoff,
-                                          rate=1)
-            if len(decayTable) > frameCount:
-                decayTable = decayTable[:frameCount]
-            else:
-                decayTable += [0.0] * (frameCount - len(decayTable))
-
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-
-                for b in decayTable:
-                    self.thisFrame += [[b * i for i in color] * self.ledCount]
-
-            self.frameCount = len(self.thisFrame)
-
-    #Lights move sequentially with decay
-    class layerComet(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerComet, self).__init__(**kwargs)
-            if self.effectRate > 0:
-                self.direction = True
-            else:
-                self.direction = False
-                self.effectRate *= -1
-
-            if self.effectCutoff <= 0: self.effectCutoff = .1
-
-            decayTable = self._decayTable(factor=len(self.paletteColors) * \
-                                            self.effectCutoff, rate=1)
-
-            gradient   = self.paletteColors[0] + \
-                self._gradient(self.paletteColors[1:], len(decayTable)+1)
-
-            decayTable = [c for b in zip(decayTable, decayTable, decayTable, decayTable) \
-                for c in b]
-
-            comet = colorArray(COLORS, [a * b for a, b in zip(gradient,decayTable)])
-
-            comet.padRight([0.0]*COLORS, self.ledCount - len(comet))
-
-            if self.direction: comet.reverse()
-            else: comet.shift(self.ledCount - len(comet))
-
-            if self.effectRate == 0:
-                self.thisFrame.append(comet[0:self.ledCount])
-            else:                           
-                for i in range(len(comet)):
-                    comet.shift(int(self.effectRate+(self.effectRate < 1)), 
-                                self.direction)
-                    self.thisFrame.append(comet[:self.ledCount])
-
-                    for x in range(int((1/self.effectRate)-(self.effectRate <= 1))):
-                        self.thisFrame.append(comet[:self.ledCount])
-
-            self.frameCount = len(self.thisFrame)
-
-    #Lights move sequentially with decay
-    class layerChase(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerChase, self).__init__(**kwargs)
-            
-            if self.effectRate > 0:
-                self.direction = True
-            else:
-                self.direction = False
-                self.effectRate *= -1
-
-            if len(self.paletteColors) == 1:
-                self.paletteColors += colorArray(COLORS,COLORS*[0])
-
-            decayTable = self._decayTable(factor=len(self.paletteColors) * \
-                            self.effectCutoff, rate=1)
-
-            gradient   = self.paletteColors[0] + \
-                self._gradient(self.paletteColors[1:], len(decayTable)+1)
-
-            decayTable = [c for b in zip(decayTable, decayTable, decayTable, decayTable) \
-                for c in b]
-            gradient  = colorArray(COLORS, [a * b
-                            for a, b in zip(gradient,decayTable)])
-
-            k=int(self.ledCount/len(gradient))+1
-            chase = colorArray(COLORS,k*gradient)
-
-            if self.direction: chase.reverse()
-            if self.effectRate == 0:
-                self.thisFrame.append(chase[0:self.ledCount])
-            else:                                                   
-                for _ in range(len(chase)):
-                    chase.shift(int(self.effectRate+(self.effectRate < 1)), 
-                                self.direction)
-                    self.thisFrame.append(chase[0:self.ledCount])
-
-                    for _ in range(int((1/self.effectRate)-(self.effectRate <= 1))):
-                        self.thisFrame.append(chase[0:self.ledCount])
-
-            self.frameCount = len(self.thisFrame)
-
-    #Cylon, single LED bounces from start to end of strip
-    class layerCylon(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerCylon, self).__init__(**kwargs)
-
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
-
+            super(ledEffect.layerBambu_idle, self).__init__(**kwargs)
             if self.effectRate <= 0:
-                raise Exception("effect rate for cylon must be > 0")
+                self.effectRate = 5.6
+            if self.effectCutoff <= 0:
+                self.effectCutoff = 3.0
 
-            # How many frames per sweep animation.
-            frames = int(self.effectRate / self.frameRate)
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
 
-            direction = True
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
 
-            for _ in range(len(self.paletteColors) % 2 + 1):
-                for c in range(0, len(self.paletteColors)):
-                    color = self.paletteColors[c]
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
 
-                    for frame in range(frames):
-                        pct = frame / (frames - 1)
-                        newFrame = []
+        def _smoothstep(self, x):
+            x = self._clamp(x)
+            return x * x * (3.0 - 2.0 * x)
 
-                        p = int(round((self.ledCount - 2) * pct) if direction else 1 + round(((self.ledCount - 2) * (1 - pct))))
+        def _mode_params(self, default_brightness=0.015, default_gamma=0.85, default_floor=0.0):
+            params = self._color(1, [default_brightness, default_gamma, default_floor, 0.0])
 
-                        for i in range(self.ledCount):
-                            newFrame += color if p == i else [0.0] * COLORS
+            brightness = self._clamp(params[0], 0.0, 1.0)
 
-                        self.thisFrame.append(newFrame)
+            local_gamma = default_gamma
+            if len(params) > 1 and params[1] > 0.0:
+                local_gamma = params[1]
+            local_gamma = max(0.10, local_gamma)
 
-                    direction = not direction
+            floor = default_floor
+            if len(params) > 2:
+                floor = params[2]
+            floor = self._clamp(floor, 0.0, brightness)
 
-            self.frameCount = len(self.thisFrame)
+            return brightness, local_gamma, floor
 
-    #Color gradient over all LEDs
-    class layerGradient(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerGradient, self).__init__(**kwargs)
-
-            direction = -1 if self.effectRate < 0 else 1
-
-            if self.effectRate == 0: 
-                gradientLength = self.ledCount
-            else:
-                gradientLength=abs(int(1/(self.effectRate * self.frameRate)))
-            gradient = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                  gradientLength,
-                                                  toFirst=True))
-
-            for i in range(gradientLength if self.effectRate != 0 else 1):
-                frame = colorArray(COLORS, ([0.0]*COLORS) * self.ledCount)
-                for led in range(self.ledCount):
-                    frame[led] = gradient[ int(i*direction + \
-                        self.effectCutoff * gradientLength * led \
-                        / self.ledCount ) % gradientLength]
-                self.thisFrame.append(frame)
-
-            self.frameCount = len(self.thisFrame)
-
-    class layerPattern(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerPattern, self).__init__(**kwargs)
-
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
-            frame = colorArray(COLORS, [])
-
-            for i in range(int(self.ledCount/len(self.paletteColors))+1):
-                frame+=(self.paletteColors)
-
-            if int(self.effectRate/self.frameRate) == 0:
-                self.thisFrame.append(frame)
-            else:
-                for _ in range(len(self.paletteColors) * (self.ledCount-1)):
-                    for _ in range(int(self.effectRate/self.frameRate)):
-                        self.thisFrame.append(colorArray(COLORS, frame)[:COLORS*self.ledCount])
-                    frame.shift(int(self.effectCutoff))
-                
-            self.frameCount = len(self.thisFrame)
-            
-    #Responds to heater temperature
-    class layerHeater(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerHeater, self).__init__(**kwargs)
-
-            if len(self.paletteColors) == 1:
-                self.paletteColors += self.paletteColors
-
-            gradient = colorArray(COLORS, self._gradient(self.paletteColors[:-1], 200) +
-                                    self.paletteColors[-1:])
-
-            for i in range(len(gradient)):
-                self.thisFrame.append(gradient[i] * self.ledCount)
-
-            self.frameCount = len(self.thisFrame)
-
-            if self.handler.heater is None:
-                raise self.handler.printer.config_error(
-                    "LED Effect '%s' has no heater defined." % (self.handler.name))
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * brightness for i in range(COLORS)]
 
         def nextFrame(self, eventtime):
-            heaterTarget  = self.frameHandler.heaterTarget[self.handler.heater]
-            heaterCurrent = self.frameHandler.heaterCurrent[self.handler.heater]
-            heaterLast    = self.frameHandler.heaterLast[self.handler.heater]
+            self.frameNumber += 1
 
-            if heaterTarget > 0.0 and heaterCurrent > 0.0:
-                if (heaterCurrent >= self.effectRate):
-                    if (heaterCurrent <= heaterTarget-2):
-                        s = int(((heaterCurrent - self.effectRate) / (heaterTarget - self.effectRate)) * 200)
-                        s = min(len(self.thisFrame)-1,s)
-                        return self.thisFrame[s]
-                    elif self.effectCutoff > 0:
-                        return None
-                    else:
-                        return self.thisFrame[-1]
-                else:
-                    return None
+            # Independent Bambu-like Idle.
+            #
+            # Palette:
+            #   color 0 = normalized color/tint
+            #   color 1 = params: (max_brightness, local_gamma, min_brightness_floor)
+            #
+            # Example:
+            #   bambu_idle 5.6 3.0 top (0.720, 0.920, 0.720),(0.015, 0.85, 0.000)
+            #
+            # Timing:
+            #   rise  = fade
+            #   top   = effectCutoff
+            #   floor = third parameter from params color
+            period = max(2.0, float(self.effectRate))
+            top_hold = self._clamp(float(self.effectCutoff), 0.1, period - 0.40)
 
-            elif self.effectRate > 0 and heaterCurrent > 0.0:
-                if heaterCurrent >= self.effectRate and heaterLast > 0:
-                    s = int(((heaterCurrent - self.effectRate) / heaterLast) * 200)
-                    s = min(len(self.thisFrame)-1,s)
-                    return self.thisFrame[s]
+            transition_time = max(0.20, (period - top_hold) / 2.0)
+            rise_time = transition_time
+            fade_time = transition_time
 
-            return None
+            t = (self.frameNumber * self.frameRate) % period
 
-    #Responds to heater temperature
-    class layerTemperature(_layerBase):
-        def __init__(self,  **kwargs):
+            base_color = self._color(0, [0.720, 0.920, 0.720, 0.0])
+            brightness, local_gamma, floor = self._mode_params(0.015, 0.85, 0.0)
 
-            super(ledEffect.layerTemperature, self).__init__(**kwargs)
-            if len(self.paletteColors) == 1:
-                self.paletteColors = colorArray(COLORS, ([0.0]*COLORS)) + self.paletteColors
-            gradient = colorArray(COLORS, self._gradient(self.paletteColors, 200))
-            for i in range(len(gradient)):
-                self.thisFrame.append(gradient[i] * self.ledCount)
-            self.frameCount = len(self.thisFrame)
+            high = self._scaled_color(base_color, brightness)
+            low = self._scaled_color(base_color, floor)
 
-            if self.handler.heater is None:
-                raise self.handler.printer.config_error(
-                    "LED Effect '%s' has no heater defined." % (self.handler.name))
-            
-        def nextFrame(self, eventtime):
-            if self.effectCutoff == self.effectRate:
-                s = 200 if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0
+            if t < rise_time:
+                phase = self._smoothstep(t / rise_time)
+            elif t < rise_time + top_hold:
+                phase = 1.0
             else:
-                s = int(((self.frameHandler.heaterCurrent[self.handler.heater] - 
-                            self.effectRate) / 
-                            (self.effectCutoff - self.effectRate)) * 200)
-                
-            s = min(len(self.thisFrame)-1,s)
-            s = max(0,s)
-            return self.thisFrame[s]
-    class layerHeaterGauge(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerHeaterGauge, self).__init__(**kwargs)
+                phase = 1.0 - self._smoothstep((t - rise_time - top_hold) / fade_time)
 
-            if self.effectRate < 0:
-                self.effectRate = self.ledCount
+            # Local per-mode gamma before global output gamma.
+            phase = pow(self._clamp(phase), local_gamma)
 
-            if self.effectCutoff < 0:
-                self.effectCutoff = self.ledCount
+            color = self._mix(low, high, phase)
+            return colorArray(COLORS, color * self.ledCount)
 
-            if self.effectRate == 0:
-                trailing = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                trailing = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                     int(self.effectRate), True))
-                trailing.padLeft([0.0]*COLORS, self.ledCount)
 
-            if self.effectCutoff == 0:
-                leading = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                leading = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                    int(self.effectCutoff), False))
-                leading.padRight([0.0]*COLORS, self.ledCount)
+    class layerBambu_flow(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_flow, self).__init__(**kwargs)
+            if self.effectRate <= 0:
+                self.effectRate = 0.90
+            if self.effectCutoff <= 0:
+                self.effectCutoff = 0.62
+            self.start_time = None
 
-            gradient = colorArray(COLORS, trailing + self.paletteColors[0] + leading)
-            gradient.shift(len(trailing), 0)
-            frames = [gradient[:self.ledCount]]
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
 
-            for i in range(0, self.ledCount):
-                gradient.shift(1,1)
-                frames.append(gradient[:self.ledCount])
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
 
-            self.thisFrame.append(colorArray(COLORS, [0.0]*COLORS * self.ledCount))
-            for i in range(1, 101):
-                x = int((i / 101.0) * self.ledCount)
-                self.thisFrame.append(frames[x])
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
 
-            self.frameCount = len(self.thisFrame)
+        def _smoothstep(self, x):
+            x = self._clamp(x)
+            return x * x * (3.0 - 2.0 * x)
 
-        def nextFrame(self, eventtime):
-            heaterTarget  = self.frameHandler.heaterTarget[self.handler.heater]
-            heaterCurrent = self.frameHandler.heaterCurrent[self.handler.heater]
-            heaterLast    = self.frameHandler.heaterLast[self.handler.heater]
-            
-            if heaterTarget > 0.0:
-                p = int(heaterCurrent/heaterTarget * 100.0)
-            elif heaterLast > 0.0:
-                p = int(heaterCurrent/heaterLast * 100.0)
-            else: 
-                p = 0
-            
-            p = min(len(self.thisFrame)-1,p)
-            p = max(0,p)
-            
-            return self.thisFrame[p]
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * self._clamp(brightness) for i in range(COLORS)]
 
-    class layerTemperatureGauge(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerTemperatureGauge, self).__init__(**kwargs)
+        def _params(self):
+            # New palette format:
+            #   color 0 = wave color
+            #   color 1 = background color
+            #   color 2 = params: (wave_brightness, background_brightness, local_gamma)
+            #
+            # Example:
+            #   bambu_flow 0.90 0.62 top (1.000,0.520,0.000),(1.000,0.300,0.000),(0.040,0.006,1.10)
+            params = self._color(2, [0.040, 0.006, 1.10, 0.0])
 
-            trailing = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                    int(self.ledCount), True))
-            trailing.padLeft([0.0]*COLORS, self.ledCount)
+            wave_brightness = self._clamp(params[0], 0.0, 1.0)
 
-            leading = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
+            background_brightness = 0.006
+            if len(params) > 1:
+                background_brightness = self._clamp(params[1], 0.0, wave_brightness)
 
-            gradient = colorArray(COLORS, trailing + self.paletteColors[0] + leading)
-            gradient.shift(len(trailing), 0)
-            frames = [gradient[:self.ledCount]]
+            local_gamma = 1.10
+            if len(params) > 2 and params[2] > 0.0:
+                local_gamma = max(0.10, params[2])
 
-            for i in range(0, self.ledCount):
-                gradient.shift(1,1)
-                frames.append(gradient[:self.ledCount])
-
-            self.thisFrame.append(colorArray(COLORS, [0.0]*COLORS * self.ledCount))
-            self.steps = 255
-            for i in range(1, self.steps + 1):
-                x = int((i / float(self.steps + 1)) * self.ledCount)
-                frames2=colorArray(COLORS,[])
-
-                for idx,led in enumerate(frames[x]):
-                    
-                    brightness = min(1.0,max(0.0,len(frames[x]) * (float(i) / float(self.steps + 1)) - int(idx/COLORS)))
-                   
-                    frames2.append(led*brightness)
-
-                self.thisFrame.append(frames2)
-
-            self.frameCount = len(self.thisFrame)
+            return wave_brightness, background_brightness, local_gamma
 
         def nextFrame(self, eventtime):
-            if self.effectCutoff == self.effectRate:
-                s = len(self.thisFrame) if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0
-            else:
-                s = int(((self.frameHandler.heaterCurrent[self.handler.heater] - 
-                            self.effectRate) / 
-                            (self.effectCutoff - self.effectRate)) * self.steps)
-                
-            s = min(len(self.thisFrame)-1,s)
-            s = max(0,s)
+            self.frameNumber += 1
 
+            # Bambu H2/H2D-like Preparing:
+            # "Orange light scrolling flow".
+            #
+            # This layer has independent wave and background controls:
+            #   color 0 = wave color
+            #   color 1 = background color
+            #   color 2 = (wave_brightness, background_brightness, local_gamma)
+            #
+            # effectRate   = flow speed
+            # effectCutoff = flow width
+            #
+            # Motion is based on eventtime to avoid visible jitter from skipped frames.
+            if self.start_time is None:
+                self.start_time = eventtime
 
+            elapsed = max(0.0, eventtime - self.start_time)
 
-            return self.thisFrame[s]
+            speed = float(self.effectRate)
+            width = self._clamp(float(self.effectCutoff), 0.30, 0.90)
 
-            
-    #Responds to analog pin voltage
-    class layerAnalogPin(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerAnalogPin, self).__init__(**kwargs)
+            wave_color = self._color(0, [1.000, 0.520, 0.000, 0.0])
+            background_color = self._color(1, [1.000, 0.300, 0.000, 0.0])
 
-            if len(self.paletteColors) == 1:
-                self.paletteColors = [0.0]*COLORS + self.paletteColors
+            wave_brightness, background_brightness, local_gamma = self._params()
 
-            gradient   = colorArray(COLORS, self._gradient(self.paletteColors, 101))
+            high = self._scaled_color(wave_color, wave_brightness)
+            low = self._scaled_color(background_color, background_brightness)
 
-            for i in range(len(gradient)):
-                self.thisFrame.append(gradient[i] * self.ledCount)
+            head = (elapsed * speed * 0.16) % 1.0
 
-        def nextFrame(self, eventtime):
-            v = int(self.handler.analogValue * self.effectRate)
-
-            if v > 100: v = 100
-
-            if v > self.effectCutoff:
-                return self.thisFrame[v]
-            else:
-                return self.thisFrame[0]
-
-    #Lights illuminate relative to stepper position
-    class layerStepper(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerStepper, self).__init__(**kwargs)
-
-            if self.effectRate < 0:
-                self.effectRate = self.ledCount
-
-            if self.effectCutoff < 0:
-                self.effectCutoff = self.ledCount
-
-            if self.effectRate == 0:
-                trailing = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                trailing = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                     int(self.effectRate), True))
-                trailing.padLeft([0.0]*COLORS, self.ledCount)
-
-            if self.effectCutoff == 0:
-                leading = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                leading = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                    int(self.effectCutoff), False))
-                leading.padRight([0.0]*COLORS, self.ledCount)
-
-            gradient = colorArray(COLORS, trailing + self.paletteColors[0] + leading)
-            gradient.shift(len(trailing)-1, 0)
-            frames = [gradient[:self.ledCount]]
-
-            for i in range(0, self.ledCount):
-                gradient.shift(1,1)
-                frames.append(gradient[:self.ledCount])
-
-            for i in range(101):
-                x = int((i / 101.0) * self.ledCount)
-                self.thisFrame.append(frames[x])
-
-            self.frameCount = len(self.thisFrame)
-
-        def nextFrame(self, eventtime):
-            if self.handler.stepper == 'x': axis = 0
-            elif self.handler.stepper == 'y': axis = 1
-            else: axis = 2
-
-            p = self.frameHandler.stepperPositions[int(axis)]
-
-            if p < 0 : p=0
-            if p > 100 : p=100
-            return self.thisFrame[int((p - 1) * (p > 0))]
-
-    class layerStepperColor(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerStepperColor, self).__init__(**kwargs)
-
-            if len(self.paletteColors) == 1:
-                self.paletteColors = [0.0]*COLORS + self.paletteColors
-
-            gradient   = colorArray(COLORS, self._gradient(self.paletteColors, 101))
-
-            for i in range(len(gradient)):
-                self.thisFrame.append(gradient[i] * self.ledCount)
-
-        def nextFrame(self, eventtime):
-            if self.handler.stepper == 'x': axis = 0
-            elif self.handler.stepper == 'y': axis = 1
-            else: axis = 2
-
-            p = self.frameHandler.stepperPositions[int(axis)]*self.effectRate+self.effectCutoff
-                        
-            if p < 0 : p=0
-            if p > 100 : p=100
-
-            return self.thisFrame[int(p)]
-
-    #Shameless port of Fire2012 by Mark Kriegsman
-
-    #Shamelessly appropriated from the Arduino FastLED example files
-    #Fire2012.ino by Daniel Garcia
-    class layerFire(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerFire, self).__init__(**kwargs)
-
-            self.heatMap    = [0.0] * self.ledCount
-            self.gradient   = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                                        102))
-            self.frameLen   = len(self.gradient)
-            self.heatLen    = len(self.heatMap)
-            self.heatSource = int(self.ledCount / 10.0)
-            self.effectRate = int(self.effectRate)
-
-            if self.heatSource < 1:
-                self.heatSource = 1
-
-        def nextFrame(self, eventtime):
             frame = []
+            for i in range(self.ledCount):
+                x = float(i) / max(1.0, float(self.ledCount - 1))
 
-            for h in range(self.heatLen):
-                c = randint(0,self.effectCutoff)
-                self.heatMap[h] -= (self.heatMap[h] - c >= 0 ) * c
+                # Cyclic distance to one broad moving wave.
+                d = abs(x - head)
+                d = min(d, 1.0 - d)
 
-            for i in range(self.ledCount - 1, self.heatSource, -1):
-                d = (self.heatMap[i - 1] +
-                     self.heatMap[i - 2] +
-                     self.heatMap[i - 3] ) / 3
+                intensity = exp(-((d / width) ** 2) * 9.0)
+                intensity = self._smoothstep(intensity)
+                intensity = pow(self._clamp(intensity), local_gamma)
 
-                self.heatMap[i] = d * (d >= 0)
+                color = self._mix(low, high, intensity)
+                frame.extend(color)
 
-            if randint(0, 100) < self.effectRate:
-                h = randint(0, self.heatSource)
-                self.heatMap[h] += randint(90,100)
-                if self.heatMap[h] > 100:
-                    self.heatMap[h] = 100
+            return colorArray(COLORS, frame)
 
-            for h in self.heatMap:
-                frame += self.gradient[int(h)]
 
-            return frame
+    class layerBambu_bar(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_bar, self).__init__(**kwargs)
+            self.display_progress = None
+            self.last_eventtime = None
 
-    #Fire that responds relative to actual vs target temp
-    class layerHeaterFire(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerHeaterFire, self).__init__(**kwargs)
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
 
-            self.heatMap    = [0.0] * self.ledCount
-            self.gradient   = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                                        102))
-            self.frameLen   = len(self.gradient)
-            self.heatLen    = len(self.heatMap)
-            self.heatSource = int(self.ledCount / 10.0)
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
 
-            if self.handler.heater is None:
-                raise self.handler.printer.config_error(
-                    "LED Effect '%s' has no heater defined." % (self.handler.name))
+        def _smoothstep(self, x):
+            x = self._clamp(x)
+            return x * x * (3.0 - 2.0 * x)
 
-            if self.heatSource < 1:
-                self.heatSource = 1
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
+
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * self._clamp(brightness) for i in range(COLORS)]
+
+        def _params(self):
+            # Palette format:
+            #   color 0 = filled/progress color
+            #   color 1 = empty/background color
+            #   color 2 = params: (filled_brightness, empty_brightness, edge_gamma)
+            #
+            # Layer fields:
+            #   effectRate   = smoothing speed, fraction/second
+            #   effectCutoff = edge width in LED
+            params = self._color(2, [0.018, 0.000, 0.85, 0.0])
+
+            filled_brightness = self._clamp(params[0], 0.0, 1.0)
+
+            empty_brightness = 0.0
+            if len(params) > 1:
+                empty_brightness = self._clamp(params[1], 0.0, filled_brightness)
+
+            edge_gamma = 0.85
+            if len(params) > 2 and params[2] > 0.0:
+                edge_gamma = max(0.10, params[2])
+
+            return filled_brightness, empty_brightness, edge_gamma
+
+        def _get_target_progress(self):
+            return self._clamp(self.frameHandler.printProgress / 100.0)
+
+        def _get_display_progress(self, eventtime, target_progress, smoothing_speed):
+            # Explicit 0% must be fully empty.
+            if target_progress <= 0.0005:
+                self.display_progress = 0.0
+                self.last_eventtime = eventtime
+                return 0.0
+
+            if self.display_progress is None:
+                self.display_progress = target_progress
+                self.last_eventtime = eventtime
+                return self.display_progress
+
+            if self.last_eventtime is None:
+                self.last_eventtime = eventtime
+
+            dt = max(0.0, min(0.25, eventtime - self.last_eventtime))
+            self.last_eventtime = eventtime
+
+            diff = target_progress - self.display_progress
+            if abs(diff) < 0.0005:
+                self.display_progress = target_progress
+                return self.display_progress
+
+            max_step = smoothing_speed * dt
+            if abs(diff) <= max_step:
+                self.display_progress = target_progress
+            else:
+                self.display_progress += max_step if diff > 0 else -max_step
+
+            return self._clamp(self.display_progress)
 
         def nextFrame(self, eventtime):
+            self.frameNumber += 1
+
+            target_progress = self._get_target_progress()
+
+            smoothing_speed = float(self.effectRate) if self.effectRate > 0 else 0.85
+            edge_width = float(self.effectCutoff) if self.effectCutoff > 0 else 1.2
+            edge_width = self._clamp(edge_width, 0.2, max(0.2, float(self.ledCount)))
+
+            progress = self._get_display_progress(eventtime, target_progress, smoothing_speed)
+
+            filled_color = self._color(0, [0.720, 0.920, 0.720, 0.0])
+            empty_color = self._color(1, [0.000, 0.000, 0.000, 0.0])
+            filled_brightness, empty_brightness, edge_gamma = self._params()
+
+            filled = self._scaled_color(filled_color, filled_brightness)
+            empty = self._scaled_color(empty_color, empty_brightness)
+
+            # Hard endpoints.
+            if target_progress <= 0.0005 and progress <= 0.0005:
+                return colorArray(COLORS, empty * self.ledCount)
+
+            if target_progress >= 0.9995 and progress >= 0.9995:
+                return colorArray(COLORS, filled * self.ledCount)
+
+            fill = progress * float(self.ledCount)
+
             frame = []
-            spark = 0
-            heaterTarget  = self.frameHandler.heaterTarget[self.handler.heater]
-            heaterCurrent = self.frameHandler.heaterCurrent[self.handler.heater]
-            heaterLast    = self.frameHandler.heaterLast[self.handler.heater]
+            for i in range(self.ledCount):
+                # One-sided progress bar:
+                # - LEDs fully before fill are filled.
+                # - LEDs fully after fill are empty.
+                # - Only a small boundary zone is anti-aliased.
+                #
+                # This prevents 90% from looking like 100% because the soft edge
+                # does not glow far forward into the empty end of the strip.
+                led_start = float(i)
+                led_end = float(i + 1)
 
-            if heaterTarget > 0.0 and heaterCurrent > 0.0:
-                if (heaterCurrent >= self.effectRate):
-                    if heaterCurrent <= heaterTarget-2:
-                        spark = int((heaterCurrent / heaterTarget) * 80)
-                        brightness = int((heaterCurrent / heaterTarget) * 100)
-                    elif self.effectCutoff > 0:
-                        spark = 0
-                    else:
-                        spark = 80
-                        brightness = 100
-            elif self.effectRate > 0 and heaterCurrent > 0.0:
-                if heaterCurrent >= self.effectRate:
-                    spark = int(((heaterCurrent - self.effectRate)
-                                      / heaterLast) * 80)
-                    brightness = int(((heaterCurrent - self.effectRate)
-                                      / heaterLast) * 100)
-
-            if spark > 0 and heaterTarget != 0:
-                cooling = int((heaterCurrent / heaterTarget) * 20)
-
-                for h in range(self.heatLen):
-                    c = randint(0, cooling)
-                    self.heatMap[h] -= (self.heatMap[h] - c >= 0 ) * c
-
-                for i in range(self.ledCount - 1, self.heatSource, -1):
-                    d = (self.heatMap[i - 1] +
-                         self.heatMap[i - 2] +
-                         self.heatMap[i - 3] ) / 3
-
-                    self.heatMap[i] = d * (d >= 0)
-
-                if randint(0, 100) < spark:
-                    h = randint(0, self.heatSource)
-                    self.heatMap[h] += brightness
-                    if self.heatMap[h] > 100:
-                        self.heatMap[h] = 100
-
-                for h in self.heatMap:
-                    frame += self.gradient[int(h)]
-
-                return frame
-
-            else:
-                return None
-
-    #Progress bar using M73 gcode command
-    class layerProgress(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerProgress, self).__init__(**kwargs)
-
-            if self.effectRate < 0:
-                self.effectRate = self.ledCount
-
-            if self.effectCutoff < 0:
-                self.effectCutoff = self.ledCount
-
-            if self.effectRate == 0:
-                trailing = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                trailing = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                     int(self.effectRate), True))
-                trailing.padLeft([0.0]*COLORS, self.ledCount)
-
-            if self.effectCutoff == 0:
-                leading = colorArray(COLORS, [0.0]*COLORS * self.ledCount)
-            else:
-                leading = colorArray(COLORS, self._gradient(self.paletteColors[1:],
-                                                    int(self.effectCutoff), False))
-                leading.padRight([0.0]*COLORS, self.ledCount)
-
-            gradient = colorArray(COLORS, trailing + self.paletteColors[0] + leading)
-            gradient.shift(len(trailing), 0)
-            frames = [gradient[:self.ledCount]]
-
-            for i in range(0, self.ledCount):
-                gradient.shift(1,1)
-                frames.append(gradient[:self.ledCount])
-
-            self.thisFrame.append(colorArray(COLORS, [0.0]*COLORS * self.ledCount))
-            for i in range(1, 101):
-                x = int((i / 101.0) * self.ledCount)
-                self.thisFrame.append(frames[x])
-
-            self.frameCount = len(self.thisFrame)
-
-        def nextFrame(self, eventtime):
-            p = self.frameHandler.printProgress
-            return self.thisFrame[p] #(p - 1) * (p > 0)]
-
-    class layerHoming(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerHoming, self).__init__(**kwargs)
-
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
-
-            gradientLength = int(self.ledCount)
-            gradient = colorArray(COLORS, self._gradient(self.paletteColors, 
-                                                gradientLength))
-
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-                self.thisFrame.append(colorArray(COLORS,color*self.ledCount))
-
-            self.decayTable = self._decayTable(factor=self.effectRate)
-            self.decayTable.append(0.0)
-            self.decayLen = len(self.decayTable)
-            self.counter=self.decayLen-1
-            self.coloridx=-1
-            self.my_flag={}
-            for endstop in self.handler.endstops:
-                self.frameHandler.homing_end_flag[endstop] = 0
-                self.my_flag[endstop] = self.frameHandler.homing_end_flag[endstop]
-
-        def nextFrame(self, eventtime):
-            for endstop in self.handler.endstops:
-
-                if self.my_flag[endstop] != self.frameHandler.homing_end_flag[endstop]:
-                    self.counter = 0
-                    self.coloridx = (self.coloridx + 1) % len(self.paletteColors)
-                    self.my_flag[endstop] = self.frameHandler.homing_end_flag[endstop]
-
-            frame = [self.decayTable[self.counter] * i for i in self.thisFrame[self.coloridx ]]
-            if self.counter < self.decayLen-1:
-                self.counter += 1 
-            
-            return frame
-    class layerSwitchButton(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerSwitchButton, self).__init__(**kwargs)
-            self.last_state = 0
-            self.coloridx = 0
-            self.fadeValue = 0.0
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
-
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-                self.thisFrame.append(colorArray(COLORS,color*self.ledCount))
-
-        def nextFrame(self, eventtime):
-            if self.handler.button_state > self.last_state:
-                self.coloridx = (self.coloridx + 1) % len(self.paletteColors)
-
-            self.last_state = self.handler.button_state
-
-            if self.last_state:
-                if self.effectRate > 0 and self.fadeValue < 1.0:
-                    self.fadeValue += (self.handler.frameRate / self.effectRate) 
+                if fill >= led_end:
+                    t = 1.0
+                elif fill <= led_start:
+                    t = 0.0
                 else:
-                    self.fadeValue = 1.0
-            else:
-                if self.effectCutoff > 0 and self.fadeValue > 0.0:
-                    self.fadeValue -= (self.handler.frameRate / self.effectCutoff)
-                else:
-                    self.fadeValue = 0.0
+                    # Fractional coverage inside the current boundary LED.
+                    t = fill - led_start
 
-            if self.fadeValue < 0: self.fadeValue = 0
-            if self.fadeValue > 1.0: self.fadeValue = 1.0
-            return [self.fadeValue * i for i in self.thisFrame[self.coloridx]]
+                # Optional very local edge softening, limited to edge_width.
+                # It affects only LEDs just behind the boundary, not the far empty end.
+                behind = fill - led_end
+                if 0.0 < edge_width and -edge_width < behind < 0.0:
+                    local = self._clamp((behind + edge_width) / edge_width)
+                    t = max(t, local * 0.18)
 
-    class layerToggleButton(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerToggleButton, self).__init__(**kwargs)
-            self.last_state = 0
-            self.last_coloridx = 0
-            self.coloridx = 0
-            self.fadeInValue = 0.0
-            self.fadeOutValue = 0.0
-            self.active = False
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
+                t = self._smoothstep(t)
+                t = pow(self._clamp(t), edge_gamma)
 
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-                self.thisFrame.append(colorArray(COLORS,color*self.ledCount))
+                color = self._mix(empty, filled, t)
+                frame.extend(color)
 
-        def nextFrame(self, eventtime):
-            if self.handler.button_state > self.last_state:
-                self.last_coloridx = self.coloridx
-                self.coloridx = (self.coloridx + 1) % len(self.paletteColors)
-                self.last_state = self.handler.button_state
-                self.fadeInValue = 0
-                self.fadeOutValue = 1.0
+            return colorArray(COLORS, frame)
 
-            self.last_state = self.handler.button_state
 
-            if self.effectRate > 0 and self.fadeInValue < 1.0:
-                self.fadeInValue += (self.handler.frameRate / self.effectRate) 
-            else:
-                self.fadeInValue = 1.0
-            if self.effectCutoff > 0 and self.fadeOutValue > 0.0:
-                self.fadeOutValue -= (self.handler.frameRate / self.effectCutoff)
-            else:
-                self.fadeOutValue = 0.0
+    class layerBambu_double_flash(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_double_flash, self).__init__(**kwargs)
+            if self.effectRate <= 0:
+                self.effectRate = 1.6
 
-            if self.fadeInValue < 0: self.fadeInValue = 0
-            if self.fadeInValue > 1.0: self.fadeInValue = 1.0
-            
-            if self.fadeOutValue < 0: self.fadeOutValue = 0
-            if self.fadeOutValue > 1.0: self.fadeOutValue = 1.0
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
 
-            frameIn = [self.fadeInValue * i for i in self.thisFrame[self.coloridx]]
-            frameOut = [self.fadeOutValue * i for i in self.thisFrame[self.last_coloridx]]
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
 
-            return [ i + o for i, o in zip(frameIn,frameOut)]
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
 
-    class layerFlashButton(_layerBase):
-        def __init__(self,  **kwargs):
-            super(ledEffect.layerFlashButton, self).__init__(**kwargs)
-            self.last_state = 0
-            self.active = False
-            self.coloridx = 0
-            self.fadeValue = 0.0
-            self.paletteColors = colorArray(COLORS, self.paletteColors)
+        def _mode_params(self, default_brightness=0.35, default_gamma=1.0):
+            params = self._color(1, [default_brightness, default_gamma, 0.0, 0.0])
+            brightness = self._clamp(params[0], 0.0, 1.0)
+            local_gamma = params[1] if len(params) > 1 and params[1] > 0.0 else default_gamma
+            return brightness, max(0.10, local_gamma)
 
-            for c in range(0, len(self.paletteColors)):
-                color = self.paletteColors[c]
-                self.thisFrame.append(colorArray(COLORS,color*self.ledCount))
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * brightness for i in range(COLORS)]
 
         def nextFrame(self, eventtime):
-            
-            if self.handler.button_state > self.last_state:
-                self.coloridx = (self.coloridx + 1) % len(self.paletteColors)
-                self.active = True
-                
-            self.last_state=self.handler.button_state
-    
-            if self.active:
-                if self.effectRate > 0 and self.fadeValue < 1.0:
-                    self.fadeValue += (self.handler.frameRate / self.effectRate) 
-                else:
-                    self.fadeValue = 1.0
-                if self.fadeValue >= 1.0: 
-                    self.fadeValue = 1.0
-                    self.active = False
-            else:
-                if self.effectCutoff > 0 and self.fadeValue > 0.0:
-                    self.fadeValue -= (self.handler.frameRate / self.effectCutoff)
-                else:
-                    self.fadeValue = 0.0
+            self.frameNumber += 1
 
-            if self.fadeValue <= 0: 
-                self.fadeValue = 0
-            
-            return [self.fadeValue * i for i in self.thisFrame[self.coloridx]]
+            # Bambu-like fault: red double flash.
+            # Palette:
+            #   color 0 = normalized alert color
+            #   color 1 = params: (brightness, local_gamma, reserved)
+            period = max(0.8, float(self.effectRate))
+            t = (self.frameNumber * self.frameRate) % period
+            x = t / period
+
+            pulse1 = exp(-((x - 0.18) / 0.045) ** 2)
+            pulse2 = exp(-((x - 0.36) / 0.045) ** 2)
+            intensity = self._clamp(max(pulse1, pulse2))
+
+            base_color = self._color(0, [1.0, 0.0, 0.0, 0.0])
+            brightness, local_gamma = self._mode_params(0.35, 1.0)
+
+            intensity = pow(intensity, local_gamma)
+
+            high = self._scaled_color(base_color, brightness)
+            low = [0.0] * COLORS
+            color = self._mix(low, high, intensity)
+
+            return colorArray(COLORS, color * self.ledCount)
+
+
+    class layerBambu_complete(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_complete, self).__init__(**kwargs)
+
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
+
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
+
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * self._clamp(brightness) for i in range(COLORS)]
+
+        def _params(self):
+            # Palette format:
+            #   color 0 = normalized complete color
+            #   color 1 = params: (brightness, reserved, reserved)
+            #
+            # Example:
+            #   bambu_complete 0 0 top (0.000,1.000,0.180),(0.030,0.000,0.000)
+            params = self._color(1, [0.030, 0.000, 0.000, 0.0])
+            brightness = self._clamp(params[0], 0.0, 1.0)
+            return brightness
+
+        def nextFrame(self, eventtime):
+            self.frameNumber += 1
+
+            # Bambu H2/H2D-like Completed:
+            # solid green stays on until user action.
+            base_color = self._color(0, [0.000, 1.000, 0.180, 0.0])
+            brightness = self._params()
+
+            color = self._scaled_color(base_color, brightness)
+            return colorArray(COLORS, color * self.ledCount)
+
+
+    class layerBambu_pause_breathe(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_pause_breathe, self).__init__(**kwargs)
+            if self.effectRate <= 0:
+                self.effectRate = 3.8
+            if self.effectCutoff <= 0:
+                self.effectCutoff = 0.0
+            self.start_time = None
+
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
+
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
+
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
+
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * self._clamp(brightness) for i in range(COLORS)]
+
+        def _params(self):
+            # Palette format:
+            #   color 0 = normalized pause color
+            #   color 1 = params: (max_brightness, local_gamma, min_brightness_floor)
+            #
+            # Example:
+            #   bambu_pause_breathe 3.8 0 top (1.000,0.180,0.000),(0.022,1.35,0.004)
+            params = self._color(1, [0.022, 1.35, 0.004, 0.0])
+
+            brightness = self._clamp(params[0], 0.0, 1.0)
+
+            local_gamma = 1.35
+            if len(params) > 1 and params[1] > 0.0:
+                local_gamma = max(0.10, params[1])
+
+            floor = 0.0
+            if len(params) > 2:
+                floor = self._clamp(params[2], 0.0, brightness)
+
+            return brightness, local_gamma, floor
+
+        def nextFrame(self, eventtime):
+            self.frameNumber += 1
+
+            # Smooth pause breathing without temporal dithering.
+            # For WS2812/NeoPixel low brightness, avoid fade-to-zero:
+            # the lowest 8-bit levels are visibly stepped/flickery.
+            if self.start_time is None:
+                self.start_time = eventtime
+
+            elapsed = max(0.0, eventtime - self.start_time)
+            period = max(0.5, float(self.effectRate))
+
+            x = (elapsed / period) % 1.0
+
+            # 0 -> 1 -> 0 cosine breath.
+            phase = 0.5 - 0.5 * cos(2.0 * pi * x)
+
+            base_color = self._color(0, [1.000, 0.180, 0.000, 0.0])
+            brightness, local_gamma, floor = self._params()
+
+            # Higher gamma skips the problematic low range faster.
+            phase = pow(self._clamp(phase), local_gamma)
+
+            high = self._scaled_color(base_color, brightness)
+            low = self._scaled_color(base_color, floor)
+
+            color = self._mix(low, high, phase)
+            return colorArray(COLORS, color * self.ledCount)
+
+
+    class layerBambu_pause_attention(_layerBase):
+        def __init__(self, **kwargs):
+            super(ledEffect.layerBambu_pause_attention, self).__init__(**kwargs)
+            if self.effectRate <= 0:
+                self.effectRate = 1.0
+
+        def _color(self, index, default):
+            if len(self.paletteColors) > index:
+                return self.paletteColors[index]
+            return default
+
+        def _clamp(self, value, low=0.0, high=1.0):
+            return max(low, min(high, value))
+
+        def _mix(self, a, b, t):
+            t = self._clamp(t)
+            return [a[i] * (1.0 - t) + b[i] * t for i in range(COLORS)]
+
+        def _scaled_color(self, color, brightness):
+            return [self._clamp(color[i]) * self._clamp(brightness) for i in range(COLORS)]
+
+        def _params(self):
+            # Palette format:
+            #   color 0 = normalized attention color
+            #   color 1 = params: (flash_brightness, background_brightness, local_gamma)
+            #
+            # Example:
+            #   bambu_pause_attention 1.0 0 top (1.000,0.180,0.000),(0.020,0.000,1.00)
+            params = self._color(1, [0.020, 0.0, 1.0, 0.0])
+
+            flash_brightness = self._clamp(params[0], 0.0, 1.0)
+
+            background_brightness = 0.0
+            if len(params) > 1:
+                background_brightness = self._clamp(params[1], 0.0, flash_brightness)
+
+            local_gamma = 1.0
+            if len(params) > 2 and params[2] > 0.0:
+                local_gamma = max(0.10, params[2])
+
+            return flash_brightness, background_brightness, local_gamma
+
+        def nextFrame(self, eventtime):
+            self.frameNumber += 1
+
+            # Sensor/attention pause:
+            # orange double flash, same timing family as Bambu error,
+            # but orange and weaker than red fault.
+            #
+            # effectRate = full double-flash cycle in seconds
+            period = max(0.45, float(self.effectRate))
+            t = (self.frameNumber * self.frameRate) % period
+            x = t / period
+
+            pulse1 = exp(-((x - 0.18) / 0.045) ** 2)
+            pulse2 = exp(-((x - 0.36) / 0.045) ** 2)
+            intensity = self._clamp(max(pulse1, pulse2))
+
+            base_color = self._color(0, [1.000, 0.180, 0.000, 0.0])
+            flash_brightness, background_brightness, local_gamma = self._params()
+
+            intensity = pow(intensity, local_gamma)
+
+            high = self._scaled_color(base_color, flash_brightness)
+            low = self._scaled_color(base_color, background_brightness)
+
+            color = self._mix(low, high, intensity)
+            return colorArray(COLORS, color * self.ledCount)
+
 
 def load_config_prefix(config):
     return ledEffect(config)
