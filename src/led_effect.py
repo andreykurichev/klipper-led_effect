@@ -84,6 +84,8 @@ class ledFrameHandler:
         self._print_detect_last_e = None
         self._print_detect_extruded = 0.0
         self.filament_status_objects = []
+        self.filament_attention_latched = False
+        self.filament_attention_last_reason = ""
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
         self.ledChains=[]
         self.gcode.register_command('STOP_LED_EFFECTS',
@@ -181,6 +183,8 @@ class ledFrameHandler:
         self._debug_respond(gcmd, "door_button_raw_state: %s" % getattr(self, "door_button_raw_state", None))
         self._debug_respond(gcmd, "print_completed: %s" % getattr(self, "print_completed", "unknown"))
         self._debug_respond(gcmd, "print_session_active: %s" % getattr(self, "print_session_active", "unknown"))
+        self._debug_respond(gcmd, "filament_attention_latched: %s" % getattr(self, "filament_attention_latched", "unknown"))
+        self._debug_respond(gcmd, "filament_attention_last_reason: %s" % getattr(self, "filament_attention_last_reason", "unknown"))
         self._debug_respond(gcmd, "completed_exited: %s" % getattr(self, "completed_exited", "unknown"))
         self._debug_respond(gcmd, "printProgress: %s" % getattr(self, "printProgress", "unknown"))
         self._debug_respond(gcmd, "auto_display_progress: %.5f" % self._get_display_progress_fraction(eventtime))
@@ -321,7 +325,7 @@ class ledFrameHandler:
                 pass
         return print_state == "paused"
 
-    def _is_filament_attention_active(self, eventtime):
+    def _is_filament_attention_active(self, eventtime, latch=False):
         # Sensor attention means: a known enabled filament sensor reports
         # filament_detected == False. This is intentionally generic, so it
         # works for switch/tangle/hall sensors without extra config macros.
@@ -334,6 +338,9 @@ class ledFrameHandler:
                 continue
 
             if "filament_detected" in status and status.get("filament_detected") is False:
+                if latch:
+                    self.filament_attention_latched = True
+                    self.filament_attention_last_reason = object_name
                 return True
 
         return False
@@ -517,7 +524,7 @@ class ledFrameHandler:
                 # Pause effects are valid only during an active print session.
                 # Manual filament load/extrude in idle must not trigger pause LEDs.
                 if self._has_print_context(eventtime, print_state):
-                    if self._is_filament_attention_active(eventtime):
+                    if self.filament_attention_latched or self._is_filament_attention_active(eventtime, latch=True):
                         new_state = "pause_attention"
                     else:
                         new_state = "pause"
@@ -527,6 +534,10 @@ class ledFrameHandler:
             elif print_state == "printing":
                 self.print_completed = False
                 self.completed_exited = False
+
+                # During active printing, remember even a short filament/tangle fault.
+                # Klipper can enter PAUSE after the sensor has already returned to normal.
+                self._is_filament_attention_active(eventtime, latch=True)
 
                 if self._is_printing_started_automatically(eventtime, print_status):
                     new_state = "printing"
@@ -543,10 +554,17 @@ class ledFrameHandler:
         # Reset transient print-session detector only when the print is truly over.
         if new_state == "completed":
             self.print_session_active = False
+            self.filament_attention_latched = False
+            self.filament_attention_last_reason = ""
             self._reset_first_layer_detector()
         elif new_state == "idle" and not self._is_print_file_active(eventtime) and print_state not in ("printing", "paused"):
             self.print_session_active = False
+            self.filament_attention_latched = False
+            self.filament_attention_last_reason = ""
             self._reset_first_layer_detector()
+        elif new_state == "printing":
+            self.filament_attention_latched = False
+            self.filament_attention_last_reason = ""
 
         if new_state != self.state:
             self.state = new_state
